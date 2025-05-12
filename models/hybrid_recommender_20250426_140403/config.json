@@ -1,0 +1,63 @@
+{
+    "data": {
+        "input_file": "recommendation_example.csv",
+        "output_dir": "output",
+        "train_test_split": 0.2,
+        "random_state": 42,
+        "category_dim": 8490,
+        "numerical_dim": 3,
+        "aspects_dim": 8490
+    },
+    "transformer": {
+        "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+        "max_length": 512,
+        "batch_size": 32
+    },
+    "gnn": {
+        "type": "gcn",
+        "hidden_channels": 128,
+        "output_dim": 64,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "similarity_threshold": 0.3,
+        "k_neighbors": 10,
+        "similarity_method": "pearson"
+    },
+    "hybrid": {
+        "fusion_output_dim": 128,
+        "learning_rate": 0.001,
+        "batch_size": 64,
+        "epochs": 10
+    },
+    "explainability": {
+        "groq_api_key": "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",
+        "groq_model": "llama3-70b-8192",
+        "max_explanation_length": 256
+    },
+    "evaluation": {
+        "k_values": [
+            5,
+            10,
+            20
+        ],
+        "metrics": [
+            "precision",
+            "recall",
+            "f1",
+            "ndcg",
+            "coverage"
+        ]
+    },
+    "paths": {
+        "model_dir": "models",
+        "log_dir": "logs",
+        "cache_dir": "cache",
+        "model_path": "models/hybrid_recommender_20250423_202214"
+    },
+    "recommendation": {
+        "product_id": null,
+        "category": null,
+        "top_n": 10
+    },
+    "mode": "train"
+}

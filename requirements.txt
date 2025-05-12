@@ -1,0 +1,16 @@
+# requirements.txt
+
+torch
+torch-geometric
+scikit-learn
+pandas
+numpy
+tqdm
+pyyaml
+requests
+langchain
+sentence-transformers
+streamlit
+python-dotenv
+matplotlib
+networkx
