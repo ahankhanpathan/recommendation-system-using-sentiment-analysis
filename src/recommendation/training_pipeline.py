@@ -1,9 +1,9 @@
 """Training loop and utilities for the HybridRecommender model."""
 
+import copy
 import json
 import logging
 import os
-import time
 from datetime import datetime
 
 import dill as pickle
@@ -17,14 +17,63 @@ from src.recommendation.models import GNNModel, HybridRecommender
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Early Stopping                                                               #
+# --------------------------------------------------------------------------- #
+
+class EarlyStopping:
+    """
+    Stops training when validation loss stops improving.
+
+    Saves the best model weights internally and restores them at the end so
+    the returned model is always the best checkpoint, not the last epoch.
+    """
+
+    def __init__(self, patience: int = 5, min_delta: float = 1e-4) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self._counter = 0
+        self._best_loss = float("inf")
+        self._best_weights: dict | None = None
+
+    def step(self, val_loss: float, model: torch.nn.Module) -> bool:
+        """
+        Call at the end of each epoch.
+
+        Returns True if training should stop.
+        """
+        if val_loss < self._best_loss - self.min_delta:
+            self._best_loss = val_loss
+            self._best_weights = copy.deepcopy(model.state_dict())
+            self._counter = 0
+            logger.info("EarlyStopping: new best val_loss=%.4f", val_loss)
+        else:
+            self._counter += 1
+            logger.info(
+                "EarlyStopping: no improvement (%d / %d)", self._counter, self.patience
+            )
+
+        return self._counter >= self.patience
+
+    def restore_best(self, model: torch.nn.Module) -> None:
+        """Load the best weights back into the model."""
+        if self._best_weights is not None:
+            model.load_state_dict(self._best_weights)
+            logger.info("EarlyStopping: best weights restored (val_loss=%.4f)", self._best_loss)
+
+
+# --------------------------------------------------------------------------- #
+# Training Pipeline                                                            #
+# --------------------------------------------------------------------------- #
+
 class TrainingPipeline:
     """Orchestrates data preparation, training, saving, and plotting."""
 
     def __init__(self, config: dict) -> None:
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model_dir = config.get("model_dir", config.get("paths", {}).get("model_dir", "models"))
-        self.log_dir = config.get("log_dir", config.get("paths", {}).get("log_dir", "logs"))
+        self.model_dir = config.get("paths", {}).get("model_dir", config.get("model_dir", "models"))
+        self.log_dir = config.get("paths", {}).get("log_dir", config.get("log_dir", "logs"))
 
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
@@ -32,9 +81,16 @@ class TrainingPipeline:
         self.history: dict = {
             "train_loss": [],
             "val_loss": [],
+            "learning_rates": [],
             "feature_weights": [],
             "epochs": 0,
+            "best_epoch": 0,
+            "best_val_loss": float("inf"),
         }
+
+    # ---------------------------------------------------------------------- #
+    # Data preparation                                                         #
+    # ---------------------------------------------------------------------- #
 
     def prepare_training_data(
         self,
@@ -99,6 +155,10 @@ class TrainingPipeline:
 
         return train_data, test_data, gnn
 
+    # ---------------------------------------------------------------------- #
+    # Training loop                                                            #
+    # ---------------------------------------------------------------------- #
+
     def train_model(
         self,
         model: HybridRecommender,
@@ -106,13 +166,37 @@ class TrainingPipeline:
         val_dataloader: DataLoader,
         epochs: int,
     ) -> HybridRecommender:
-        """Run the training loop and populate `self.history`."""
+        """
+        Run the training loop with:
+        - ReduceLROnPlateau learning-rate scheduling
+        - Gradient clipping (max_norm configurable)
+        - Early stopping with best-weight restoration
+        """
+        hybrid_cfg = self.config.get("hybrid", {})
+        lr: float = hybrid_cfg.get("learning_rate", 1e-3)
+        max_grad_norm: float = hybrid_cfg.get("max_grad_norm", 1.0)
+        patience: int = hybrid_cfg.get("early_stopping_patience", 5)
+        lr_patience: int = hybrid_cfg.get("lr_scheduler_patience", 2)
+        lr_factor: float = hybrid_cfg.get("lr_scheduler_factor", 0.5)
+        min_lr: float = hybrid_cfg.get("min_lr", 1e-6)
+
         model.to(self.device)
         criterion = torch.nn.BCELoss()
-        lr = self.config.get("learning_rate", self.config.get("hybrid", {}).get("learning_rate", 1e-3))
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=lr_factor,
+            patience=lr_patience,
+            min_lr=min_lr,
+        )
+        early_stopping = EarlyStopping(patience=patience)
+
         for epoch in range(epochs):
+            # ---------------------------------------------------------------- #
+            # Training pass                                                     #
+            # ---------------------------------------------------------------- #
             model.train()
             train_loss = 0.0
             feature_weights_sum = None
@@ -125,6 +209,10 @@ class TrainingPipeline:
                 preds, attn_weights, _ = model(emb, gnn_f, cat, num, asp)
                 loss = criterion(preds, targets.unsqueeze(1))
                 loss.backward()
+
+                # Gradient clipping — prevents exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
                 optimizer.step()
 
                 train_loss += loss.item()
@@ -138,6 +226,9 @@ class TrainingPipeline:
             avg_train_loss = train_loss / num_batches
             avg_feature_weights = feature_weights_sum / num_batches
 
+            # ---------------------------------------------------------------- #
+            # Validation pass                                                   #
+            # ---------------------------------------------------------------- #
             model.eval()
             val_loss = 0.0
             num_val = 0
@@ -149,20 +240,48 @@ class TrainingPipeline:
                     num_val += 1
 
             avg_val_loss = val_loss / num_val
+            current_lr = optimizer.param_groups[0]["lr"]
 
             logger.info(
-                "Epoch %d/%d — train loss: %.4f  val loss: %.4f",
-                epoch + 1, epochs, avg_train_loss, avg_val_loss,
+                "Epoch %d/%d — train: %.4f  val: %.4f  lr: %.2e",
+                epoch + 1, epochs, avg_train_loss, avg_val_loss, current_lr,
             )
+
+            # ---------------------------------------------------------------- #
+            # Scheduler + history                                               #
+            # ---------------------------------------------------------------- #
+            scheduler.step(avg_val_loss)
 
             self.history["train_loss"].append(avg_train_loss)
             self.history["val_loss"].append(avg_val_loss)
+            self.history["learning_rates"].append(current_lr)
             self.history["feature_weights"].append(
                 avg_feature_weights.detach().cpu().numpy().tolist()
             )
             self.history["epochs"] = epoch + 1
 
+            if avg_val_loss < self.history["best_val_loss"]:
+                self.history["best_val_loss"] = avg_val_loss
+                self.history["best_epoch"] = epoch + 1
+
+            # ---------------------------------------------------------------- #
+            # Early stopping                                                    #
+            # ---------------------------------------------------------------- #
+            if early_stopping.step(avg_val_loss, model):
+                logger.info("Early stopping triggered at epoch %d.", epoch + 1)
+                break
+
+        early_stopping.restore_best(model)
+        logger.info(
+            "Training complete. Best epoch: %d, best val_loss: %.4f",
+            self.history["best_epoch"],
+            self.history["best_val_loss"],
+        )
         return model
+
+    # ---------------------------------------------------------------------- #
+    # Persistence                                                              #
+    # ---------------------------------------------------------------------- #
 
     def save_model(
         self,
@@ -197,30 +316,55 @@ class TrainingPipeline:
         logger.info("Model saved to %s", model_path)
         return model_path
 
+    # ---------------------------------------------------------------------- #
+    # Visualisation                                                            #
+    # ---------------------------------------------------------------------- #
+
     def plot_training_history(self, output_path: str | None = None) -> None:
-        """Plot training/validation loss and per-feature attention weights over epochs."""
+        """
+        Plot three panels:
+        1. Training vs validation loss with best-epoch marker
+        2. Learning rate schedule over epochs
+        3. Per-feature attention weights over time
+        """
         epochs = list(range(1, self.history["epochs"] + 1))
         feature_names = ["Text", "Graph", "Category", "Numerical", "Aspects"]
         feature_weights = np.array(self.history["feature_weights"])
 
-        fig, axs = plt.subplots(2, 1, figsize=(10, 12))
+        fig, axs = plt.subplots(3, 1, figsize=(10, 15))
 
-        axs[0].plot(epochs, self.history["train_loss"], "b-", label="Training Loss")
-        axs[0].plot(epochs, self.history["val_loss"], "r-", label="Validation Loss")
+        # --- Loss ---
+        axs[0].plot(epochs, self.history["train_loss"], "b-o", markersize=4, label="Train Loss")
+        axs[0].plot(epochs, self.history["val_loss"], "r-o", markersize=4, label="Val Loss")
+        best_ep = self.history.get("best_epoch", 0)
+        if best_ep:
+            axs[0].axvline(best_ep, color="green", linestyle="--", alpha=0.7, label=f"Best epoch ({best_ep})")
         axs[0].set_title("Training and Validation Loss")
-        axs[0].set_xlabel("Epochs")
-        axs[0].set_ylabel("Loss")
+        axs[0].set_xlabel("Epoch")
+        axs[0].set_ylabel("BCE Loss")
         axs[0].legend()
+        axs[0].grid(alpha=0.3)
 
+        # --- Learning rate ---
+        if self.history.get("learning_rates"):
+            axs[1].plot(epochs, self.history["learning_rates"], "g-o", markersize=4)
+            axs[1].set_title("Learning Rate Schedule")
+            axs[1].set_xlabel("Epoch")
+            axs[1].set_ylabel("Learning Rate")
+            axs[1].set_yscale("log")
+            axs[1].grid(alpha=0.3)
+
+        # --- Feature weights ---
         for i, name in enumerate(feature_names):
-            axs[1].plot(epochs, feature_weights[:, i], label=name)
-        axs[1].set_title("Feature Importance Weights Over Time")
-        axs[1].set_xlabel("Epochs")
-        axs[1].set_ylabel("Weight")
-        axs[1].legend()
+            axs[2].plot(epochs, feature_weights[:, i], marker="o", markersize=3, label=name)
+        axs[2].set_title("Feature Importance Weights Over Time")
+        axs[2].set_xlabel("Epoch")
+        axs[2].set_ylabel("Attention Weight")
+        axs[2].legend()
+        axs[2].grid(alpha=0.3)
 
         plt.tight_layout()
         if output_path:
-            plt.savefig(output_path)
+            plt.savefig(output_path, dpi=150)
             logger.info("Training history plot saved to %s", output_path)
         plt.show()
