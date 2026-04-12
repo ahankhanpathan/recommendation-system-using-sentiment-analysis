@@ -1,16 +1,28 @@
-# requirements.txt
-
+# Core ML
 torch
 torch-geometric
-scikit-learn
+transformers
+sentence-transformers
+
+# NLP / LLM
+langchain
+langchain-community
+
+# Data
 pandas
 numpy
+scikit-learn
+scipy
+
+# Utilities
 tqdm
 pyyaml
 requests
-langchain
-sentence-transformers
-streamlit
 python-dotenv
+dill
+
+# Visualisation
 matplotlib
-networkx
+
+# App
+streamlit
