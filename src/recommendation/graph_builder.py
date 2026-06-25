@@ -1,82 +1,75 @@
-# graph_builder.py
+"""Product similarity graph builder for use with PyTorch Geometric GNNs."""
 
+import logging
 
-import torch
-import torch_geometric
-from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, GATConv
 import numpy as np
+import torch
 from sklearn.metrics.pairwise import cosine_similarity
-import scipy.sparse as sp
+
+logger = logging.getLogger(__name__)
+
 
 class GraphBuilder:
-    def __init__(self, config):
+    """
+    Builds a sparse k-NN product similarity graph from text embeddings.
+
+    Optionally restricts edges to products in the same category so the GNN
+    learns within-category relational signals only.
+    """
+
+    def __init__(self, config: dict) -> None:
         self.config = config
-        self.similarity_threshold = config.get('similarity_threshold', 0.5)
-        
-    def build_product_graph(self, embeddings, category_features=None, k=10):
+        self.similarity_threshold: float = config.get("similarity_threshold", 0.3)
+        self.k: int = config.get("k_neighbors", 10)
+
+    def build_product_graph(
+        self,
+        embeddings: np.ndarray,
+        category_features: np.ndarray | None = None,
+        k: int | None = None,
+    ) -> tuple:
         """
-        Build a product similarity graph based on embeddings and optional category features
-        
+        Build a product similarity graph.
+
         Args:
-            embeddings: Numpy array of product embeddings
-            category_features: Optional categorical features to enforce category constraints
-            k: Number of nearest neighbors to connect in the graph
-            
+            embeddings: (N, D) array of product embeddings.
+            category_features: Optional (N, C) one-hot category matrix.
+                               When provided, edges are restricted to same-category pairs.
+            k: Number of nearest neighbours per node (overrides config value if given).
+
         Returns:
-            edge_index: PyTorch Geometric edge index tensor
-            edge_attr: Edge weights based on similarity
+            edge_index: (2, E) LongTensor of directed edges.
+            edge_attr: (E,) FloatTensor of similarity weights.
         """
-        num_products = embeddings.shape[0]
-        
-        # Calculate cosine similarity matrix
-        similarity = cosine_similarity(embeddings)
-        
-        # Apply category constraints if provided
-        # if category_features is not None:
-        #     category_mask = category_features @ category_features.T
-        #     similarity = similarity * (category_mask > 0).astype(float)
+        k = k or self.k
+        similarity = cosine_similarity(embeddings)  # (N, N)
 
-        # #--mask for category
-        # if category_features is not None:
-        #    # only connect products with identical main_category
-        #     same_cat = (category_features[:, None] == category_features[None, :]).all(axis=2)
-        #     similarity = similarity * same_cat.astype(float)
-
-        #New cateogry for category 
         if category_features is not None:
-    # category_features is one–hot → turn it into a single id
-            cat_id = category_features.argmax(1)          # (N,)
-            same_cat = cat_id[:, None] == cat_id[None, :]
-            similarity *= same_cat.astype(float)
+            cat_id = category_features.argmax(axis=1)         # (N,)
+            same_cat = cat_id[:, None] == cat_id[None, :]     # (N, N) bool
+            similarity = similarity * same_cat.astype(float)
 
-        
-        # Convert to sparse representation for efficiency
-        similarity_sparse = self._get_k_nearest_neighbors(similarity, k)
-        
-        # Create edge index and attributes for PyTorch Geometric
+        similarity_sparse = self._top_k_sparse(similarity, k)
+
         rows, cols = similarity_sparse.nonzero()
         edge_index = torch.tensor(np.vstack((rows, cols)), dtype=torch.long)
         edge_attr = torch.tensor(similarity_sparse[rows, cols], dtype=torch.float)
-        
-        return edge_index, edge_attr
-    
-    def _get_k_nearest_neighbors(self, similarity_matrix, k):
-        """Get k nearest neighbors for each node from similarity matrix"""
-        n = similarity_matrix.shape[0]
-        
-        # Create masks for top-k values
-        similarity_sparse = np.zeros_like(similarity_matrix)
-        
-        # For each row, get the top k indices
-        for i in range(n):
-            # Sort similarities in descending order
-            top_indices = np.argsort(-similarity_matrix[i, :])[:k+1]  # +1 to include self
-            
-            # Set the corresponding values in the sparse matrix
-            for j in top_indices:
-                if i != j and similarity_matrix[i, j] > self.similarity_threshold:  # Exclude self-loops
-                    similarity_sparse[i, j] = similarity_matrix[i, j]
-        
-        return similarity_sparse
 
+        logger.info(
+            "Graph built: %d nodes, %d edges (k=%d, threshold=%.2f)",
+            embeddings.shape[0], edge_index.shape[1], k, self.similarity_threshold,
+        )
+        return edge_index, edge_attr
+
+    def _top_k_sparse(self, similarity_matrix: np.ndarray, k: int) -> np.ndarray:
+        """Return a sparse matrix keeping only the top-k neighbours per row."""
+        n = similarity_matrix.shape[0]
+        sparse = np.zeros_like(similarity_matrix)
+
+        for i in range(n):
+            top_idx = np.argsort(-similarity_matrix[i])[:k + 1]  # +1 includes self
+            for j in top_idx:
+                if i != j and similarity_matrix[i, j] > self.similarity_threshold:
+                    sparse[i, j] = similarity_matrix[i, j]
+
+        return sparse

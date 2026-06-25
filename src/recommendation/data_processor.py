@@ -1,46 +1,73 @@
-# # Data Processing Pipeline
+"""Data loading and preprocessing utilities."""
 
-
-
-import pandas as pd
-import numpy as np
-import torch
+import logging
 import os
-import json
-from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+logger = logging.getLogger(__name__)
+
 
 class DataProcessor:
-    def __init__(self, config):
+    """Loads a product CSV, applies preprocessing, and provides train/test splits."""
+
+    def __init__(self, config: dict) -> None:
         self.config = config
-        
-    def load_data(self, filepath):
-        """Load and preprocess the dataset"""
+
+    def load_data(self, filepath: str) -> pd.DataFrame:
+        """
+        Load and preprocess the product dataset.
+
+        - Parses timestamps.
+        - Negates sentiment scores for negative reviews.
+        - Fills common missing values.
+        - Creates the ``all_text`` column used by the embedder.
+        """
+        logger.info("Loading data from %s", filepath)
         df = pd.read_csv(filepath)
-        
-        # Apply existing preprocessing steps from your code
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        df['score'] = pd.to_numeric(df['score'], errors='coerce')
-        df.loc[df['sentiment'].str.lower() == 'negative', 'score'] = -1 * df.loc[df['sentiment'].str.lower() == 'negative', 'score']
-        
-        # Fill missing values
-        df['main_category'] = df['main_category'].fillna("unknown")
-        df['title'] = df['title'].fillna("unknown")
-        df['description'] = df['description'].fillna("")
-        
-        # Create combined text fields for embedding generation
-        df['all_text'] = df['title'] + " " + df['description'] + " " + df['text']
-        
+
+        # Timestamp
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+        # Sentiment-weighted score
+        if "score" in df.columns and "sentiment" in df.columns:
+            df["score"] = pd.to_numeric(df["score"], errors="coerce")
+            neg_mask = df["sentiment"].str.lower() == "negative"
+            df.loc[neg_mask, "score"] = -1 * df.loc[neg_mask, "score"].abs()
+
+        # Fill common missing values
+        df["main_category"] = df.get("main_category", pd.Series("unknown")).fillna("unknown")
+        df["title"] = df.get("title", pd.Series("unknown")).fillna("unknown")
+        df["description"] = df.get("description", pd.Series("")).fillna("")
+
+        # Build the combined text field used for embedding generation
+        text_parts = [df["title"], df["description"]]
+        if "text" in df.columns:
+            text_parts.append(df["text"].fillna(""))
+        df["all_text"] = pd.concat(text_parts, axis=1).apply(
+            lambda row: " ".join(row.values.astype(str)), axis=1
+        )
+
+        logger.info("Loaded %d rows, %d columns", len(df), len(df.columns))
         return df
-    
-    def create_train_test_split(self, df, test_size=0.2, random_state=42):
-        """Split data into training and testing sets"""
-        from sklearn.model_selection import train_test_split
-        train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
-        return train_df, test_df
-    
-    def save_processed_data(self, df, output_path):
-        """Save processed dataframe"""
+
+    def create_train_test_split(
+        self,
+        df: pd.DataFrame,
+        test_size: float = 0.2,
+        random_state: int = 42,
+    ) -> tuple:
+        """Return (train_df, test_df) with reset indices."""
+        train_df, test_df = train_test_split(
+            df, test_size=test_size, random_state=random_state
+        )
+        return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
+
+    def save_processed_data(self, df: pd.DataFrame, output_path: str) -> None:
+        """Save the processed dataframe to CSV."""
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         df.to_csv(output_path, index=False)
-        print(f"Processed data saved to {output_path}")
-
+        logger.info("Processed data saved to %s", output_path)
